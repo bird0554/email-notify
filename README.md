@@ -1,6 +1,6 @@
 # email-notify：Codex 邮件告知技能
 
-这个技能用于在 Codex 任务完成后，把经过脱敏的结果摘要通过 SMTP 发送到指定邮箱。它只在用户明确调用或明确要求发送邮件时运行，不会自动外发任务内容。
+这个技能用于在 Codex 任务完成后，把经过脱敏的结果摘要通过 SMTP 发送邮件。用户在提示词中调用 `$email-notify` 或明确要求邮件告知时，技能整理摘要，再调用随附的 `scripts/send_email.py` 完成发送；不会自行在未授权时外发任务内容。提示词可以指定额外收件人，例如“调用 `$email-notify`，完成后把摘要也发送到 `team@example.com`”。
 
 ## 目录结构
 
@@ -64,8 +64,11 @@ python -m pip install keyring
 ```powershell
 python .\scripts\send_email.py `
   --input .\completion-summary.txt `
-  --subject "Codex 任务完成"
+  --subject "Codex 任务完成" `
+  --to "team@example.com"
 ```
+
+配置中的默认收件邮箱始终会收到邮件。提示词里指定的邮箱通过 `--to` 作为额外收件人追加，不能替换默认邮箱；多个额外邮箱可重复指定 `--to` 或用逗号分隔。不指定时，只发送到默认邮箱。每个收件人会收到单独的一封邮件，收件人之间不会看到彼此地址；投递与去重状态也按收件人分别记录。
 
 从标准输入发送：
 

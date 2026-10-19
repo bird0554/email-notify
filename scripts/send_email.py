@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 MAX_BODY = 20_000
+EMAIL_PATTERN = re.compile(r"^[^@\s,<>]+@[^@\s,<>]+\.[^@\s,<>]+$")
 SECRET_PATTERNS = (
     re.compile(r"(?is)(password|passwd|pwd|token|secret|api[_-]?key|private[_-]?key)\s*[:=]\s*[^\s,;]+"),
     re.compile(r"(?is)bearer\s+[A-Za-z0-9._~+/=-]+"),
@@ -52,8 +53,31 @@ def redact(text: str) -> str:
     return clean
 
 
-def digest(subject: str, body: str) -> str:
-    return hashlib.sha256((subject.strip() + "\n" + body).encode("utf-8")).hexdigest()
+def digest(subject: str, body: str, recipient: str) -> str:
+    payload = subject.strip() + "\n" + body + "\n" + recipient.casefold()
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def resolve_recipients(defaults: str, additions: list[str]) -> list[str]:
+    """Keep configured recipients and append any prompt-specific recipients."""
+    candidates = [item.strip() for item in defaults.split(",")]
+    for value in additions:
+        candidates.extend(item.strip() for item in value.split(","))
+
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for address in candidates:
+        if not address:
+            continue
+        if not EMAIL_PATTERN.fullmatch(address):
+            raise ValueError("invalid recipient address")
+        key = address.casefold()
+        if key not in seen:
+            recipients.append(address)
+            seen.add(key)
+    if not recipients:
+        raise ValueError("missing protected setting: EMAIL_NOTIFY_TO")
+    return recipients
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +88,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subject", default="Codex task completed")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="ignore an existing sent digest")
+    parser.add_argument(
+        "--to", action="append", default=[], metavar="EMAIL",
+        help="add a recipient; may be repeated or contain comma-separated addresses (configured default is always included)",
+    )
     parser.add_argument("--retries", type=int, default=None)
     return parser.parse_args()
 
@@ -85,52 +113,62 @@ def main() -> int:
         if not body:
             raise ValueError("summary is empty")
         subject = redact(args.subject).strip()[:200] or "Codex task completed"
-        payload_digest = digest(subject, body)
+        recipients = resolve_recipients(setting("EMAIL_NOTIFY_TO", required=True), args.to)
         state_dir = Path(setting("EMAIL_NOTIFY_STATE_DIR", ".email-notify-state"))
-        marker = state_dir / f"{payload_digest}.sent"
-        if marker.exists() and not args.force:
-            print("notification already sent (idempotency digest matched)")
-            return 0
         host = setting("EMAIL_NOTIFY_SMTP_HOST", required=True)
         port = int(setting("EMAIL_NOTIFY_SMTP_PORT", "587"))
         user = setting("EMAIL_NOTIFY_SMTP_USER")
         password = setting("EMAIL_NOTIFY_SMTP_PASSWORD")
         sender = setting("EMAIL_NOTIFY_FROM", user, required=True)
-        recipients = [item.strip() for item in setting("EMAIL_NOTIFY_TO", required=True).split(",") if item.strip()]
-        if not recipients:
-            raise ValueError("missing protected setting: EMAIL_NOTIFY_TO")
         timeout = float(setting("EMAIL_NOTIFY_SMTP_TIMEOUT", "20"))
         retries = max(0, args.retries if args.retries is not None else int(setting("EMAIL_NOTIFY_RETRIES", "3")))
         retry_base = max(0.1, float(setting("EMAIL_NOTIFY_RETRY_BASE_SECONDS", "1")))
         if args.dry_run:
-            print(f"dry-run ok: body_chars={len(body)} digest={payload_digest} retries={retries}")
+            print(f"dry-run ok: body_chars={len(body)} recipients={len(recipients)} retries={retries}")
             return 0
 
-        message = EmailMessage()
-        message["Subject"] = subject
-        message["From"] = sender
-        message["To"] = ", ".join(recipients)
-        message.set_content(body)
-        last_error: Optional[Exception] = None
-        for attempt in range(retries + 1):
-            try:
-                with smtplib.SMTP(host, port, timeout=timeout) as smtp:
-                    smtp.ehlo()
-                    smtp.starttls()
-                    smtp.ehlo()
-                    if user:
-                        smtp.login(user, password)
-                    smtp.send_message(message)
-                state_dir.mkdir(parents=True, exist_ok=True)
-                marker.write_text("sent\n", encoding="ascii")
-                print(f"notification sent: digest={payload_digest}")
-                return 0
-            except (OSError, smtplib.SMTPException) as exc:
-                last_error = exc
-                if attempt < retries:
-                    time.sleep(retry_base * (2 ** attempt))
-        print(f"notification failed after {retries + 1} attempts: {type(last_error).__name__}", file=sys.stderr)
-        return 2
+        sent = skipped = failed = 0
+        error_types: set[str] = set()
+        for recipient in recipients:
+            payload_digest = digest(subject, body, recipient)
+            marker = state_dir / f"{payload_digest}.sent"
+            if marker.exists() and not args.force:
+                skipped += 1
+                continue
+
+            message = EmailMessage()
+            message["Subject"] = subject
+            message["From"] = sender
+            message["To"] = recipient
+            message.set_content(body)
+            last_error: Optional[Exception] = None
+            for attempt in range(retries + 1):
+                try:
+                    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+                        smtp.ehlo()
+                        smtp.starttls()
+                        smtp.ehlo()
+                        if user:
+                            smtp.login(user, password)
+                        smtp.send_message(message, to_addrs=[recipient])
+                    state_dir.mkdir(parents=True, exist_ok=True)
+                    marker.write_text("sent\n", encoding="ascii")
+                    sent += 1
+                    last_error = None
+                    break
+                except (OSError, smtplib.SMTPException) as exc:
+                    last_error = exc
+                    if attempt < retries:
+                        time.sleep(retry_base * (2 ** attempt))
+            if last_error:
+                failed += 1
+                error_types.add(type(last_error).__name__)
+
+        print(f"notification results: sent={sent} skipped={skipped} failed={failed}")
+        if failed:
+            print(f"notification delivery errors: {', '.join(sorted(error_types))}", file=sys.stderr)
+            return 2
+        return 0
     except (OSError, ValueError) as exc:
         print(f"notification configuration/input error: {exc}", file=sys.stderr)
         return 2
